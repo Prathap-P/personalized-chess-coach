@@ -1,0 +1,43 @@
+[tool.poetry]
+name = "chess-coach"
+version = "0.1.0"
+description = "Personalized Chess Coach - AI-powered game analysis"
+authors = ["Your Name <your.email@example.com>"]
+readme = "README.md"
+packages = [{include = "chess_coach", from = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+python-chess = "^1.999"
+stockfish = "^3.28"
+litellm = "^1.30"
+typer = {extras = ["all"], version = "^0.9"}
+rich = "^13.7"
+httpx = "^0.26"
+requests = "^2.31"
+pydantic = "^2.5"
+pydantic-settings = "^2.1"
+sqlalchemy = "^2.0"
+python-dotenv = "^1.0"
+platformdirs = "^4.1"
+tqdm = "^4.66"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4"
+black = "^23.12"
+ruff = "^0.1"
+
+[tool.poetry.scripts]
+chess-coach = "chess_coach.cli:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 88
+target-version = ['py311']
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"

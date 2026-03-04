@@ -40,6 +40,7 @@ class GameAnalyzer:
         pgn: str,
         game_id: Optional[str] = None,
         target_player: Optional[str] = None,
+        progress_callback=None,
     ) -> GameAnalysis:
         """
         Analyze a complete chess game.
@@ -71,7 +72,7 @@ class GameAnalyzer:
                 target_color = chess.BLACK
 
         # Analyze all moves (always both colors for per-player stats)
-        move_analyses = self._analyze_moves(game)
+        move_analyses = self._analyze_moves(game, progress_callback=progress_callback)
 
         # Calculate per-player stats
         white_stats = self._calculate_player_stats(move_analyses, chess.WHITE)
@@ -142,13 +143,14 @@ class GameAnalyzer:
         return metadata
 
     def _analyze_moves(
-        self, game: chess.pgn.Game
+        self, game: chess.pgn.Game, progress_callback=None
     ) -> list[MoveAnalysis]:
         """
         Analyze all moves in the game (both colors).
 
         Args:
             game: PGN game object
+            progress_callback: Optional callable(current, total) for progress reporting
 
         Returns:
             List of move analyses
@@ -156,7 +158,7 @@ class GameAnalyzer:
         analyses = []
         board = game.board()
         node = game
-
+        total_moves = sum(1 for _ in game.mainline_moves())
         move_number = 0
 
         while node.variations:
@@ -227,6 +229,9 @@ class GameAnalyzer:
             )
 
             analyses.append(move_analysis)
+
+            if progress_callback:
+                progress_callback(move_number, total_moves)
 
         return analyses
 

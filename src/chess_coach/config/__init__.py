@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     openai_api_key: Optional[str] = None
     anthropic_api_key: Optional[str] = None
     default_llm_provider: str = "openai"
-    default_llm_model: str = "nemotron-3-nano"
+    default_llm_model: str = "qwen3.5-35b-a3b"
     llm_base_url: Optional[str] = None  # For LM Studio, Ollama, or other local servers
 
     # Stockfish Configuration
@@ -46,6 +46,11 @@ class Settings(BaseSettings):
 
     # Logging
     log_level: str = "INFO"
+
+    # API Authentication
+    api_username: str = "admin"
+    api_password_hash: str = ""  # bcrypt hash; set via 'chess-coach api-setup'
+    api_secret_key: str = ""    # JWT signing secret; set via 'chess-coach api-setup'
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)

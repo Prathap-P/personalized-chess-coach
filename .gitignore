@@ -56,3 +56,5 @@ uv.lock
 !README.md
 
 data/
+
+*/node_modules

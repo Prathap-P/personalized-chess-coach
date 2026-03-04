@@ -50,6 +50,15 @@ class GameStorage:
                 ON game_analyses(analyzed_at)
             """)
 
+            # Cache key → game_id mapping for fast re-analysis lookup
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS analysis_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    game_id   TEXT NOT NULL,
+                    created_at TIMESTAMP NOT NULL
+                )
+            """)
+
     def save_analysis(self, analysis: GameAnalysis) -> None:
         """
         Save game analysis to database.
@@ -253,3 +262,40 @@ class GameStorage:
                 (game_id,)
             )
             return cursor.rowcount > 0
+
+    def count_analyses(self) -> int:
+        """Return the total number of stored game analyses."""
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute("SELECT COUNT(*) FROM game_analyses").fetchone()
+            return row[0] if row else 0
+
+    def get_cached_analysis(self, cache_key: str, ttl_days: int = 7) -> Optional[GameAnalysis]:
+        """Return a previously cached GameAnalysis by cache key, or None if expired/missing."""
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT game_id, created_at FROM analysis_cache WHERE cache_key = ?",
+                (cache_key,),
+            ).fetchone()
+            if not row:
+                return None
+            game_id, created_at_str = row
+            # TTL check
+            try:
+                created_at = datetime.fromisoformat(created_at_str)
+                age_days = (datetime.utcnow() - created_at).days
+                if age_days > ttl_days:
+                    return None
+            except Exception:
+                return None
+        return self.load_analysis(game_id)
+
+    def set_cache_entry(self, cache_key: str, game_id: str) -> None:
+        """Record that *game_id* is the cached result for *cache_key*."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO analysis_cache (cache_key, game_id, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (cache_key, game_id, datetime.utcnow().isoformat()),
+            )

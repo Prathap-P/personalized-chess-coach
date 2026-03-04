@@ -10,7 +10,7 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 import chess
 
-from ..config import settings
+from ..config import settings, _find_env_file
 from ..engine import StockfishEngine
 from ..llm import LLMClient
 from ..analysis.game_analyzer import GameAnalyzer
@@ -468,6 +468,143 @@ def config_show():
     console.print(f"  Data dir: [cyan]{settings.data_dir}[/cyan]")
     console.print(f"  Cache dir: [cyan]{settings.cache_dir}[/cyan]")
     console.print(f"  Logs dir: [cyan]{settings.logs_dir}[/cyan]")
+    console.print("\n[bold]API:[/bold]")
+    console.print(f"  Username: [cyan]{settings.api_username}[/cyan]")
+    console.print(f"  Auth configured: {'[green]yes[/green]' if settings.api_password_hash else '[yellow]no — run chess-coach api-setup[/yellow]'}")
+
+
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", "--host", help="Host to bind to"),
+    port: int = typer.Option(8000, "--port", help="Port to listen on"),
+    reload: bool = typer.Option(False, "--reload", help="Enable auto-reload (dev mode)"),
+    daemon: bool = typer.Option(False, "--daemon", "-d", help="Run as background daemon"),
+):
+    """Start the Chess Coach API server."""
+    if not settings.api_password_hash or not settings.api_secret_key:
+        console.print(
+            "⚠️  API auth not configured. Run [cyan]chess-coach api-setup[/cyan] first.",
+            style="yellow",
+        )
+        raise typer.Exit(1)
+
+    if daemon:
+        import subprocess
+        import sys
+
+        pid_file = PROJECT_ROOT / "data" / "server.pid"
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+
+        proc = subprocess.Popen(
+            [
+                sys.executable, "-m", "uvicorn",
+                "chess_coach.api:app",
+                "--host", host,
+                "--port", str(port),
+                "--ws-ping-interval", "20",
+                "--ws-ping-timeout", "60",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        pid_file.write_text(str(proc.pid))
+        console.print(f"✅ Chess Coach API daemon started (PID: [cyan]{proc.pid}[/cyan])")
+        console.print(f"   API:  http://{host}:{port}")
+        console.print(f"   Docs: http://{host}:{port}/docs")
+        console.print(f"   Stop: [cyan]chess-coach stop[/cyan]")
+    else:
+        import uvicorn
+        from ..api import app as fastapi_app
+
+        console.print(f"🚀 Chess Coach API running at [cyan]http://{host}:{port}[/cyan]")
+        console.print(f"   Docs: [cyan]http://{host}:{port}/docs[/cyan]")
+        console.print("   Press Ctrl+C to stop.")
+        uvicorn.run(
+            fastapi_app,
+            host=host,
+            port=port,
+            reload=reload,
+            ws_ping_interval=20,   # protocol-level WS ping every 20 s
+            ws_ping_timeout=60,    # close if no pong within 60 s
+        )
+
+
+@app.command(name="stop")
+def stop_server():
+    """Stop the Chess Coach API daemon."""
+    pid_file = PROJECT_ROOT / "data" / "server.pid"
+    if not pid_file.exists():
+        console.print("⚠️  No server PID file found. Is the daemon running?", style="yellow")
+        raise typer.Exit(1)
+
+    import os
+    import signal
+
+    pid = int(pid_file.read_text().strip())
+    try:
+        os.kill(pid, signal.SIGTERM)
+        pid_file.unlink(missing_ok=True)
+        console.print(f"✅ Server stopped (PID: [cyan]{pid}[/cyan])", style="green")
+    except ProcessLookupError:
+        pid_file.unlink(missing_ok=True)
+        console.print(f"⚠️  Process {pid} not found (already stopped?)", style="yellow")
+    except PermissionError:
+        console.print(f"❌ Permission denied to stop process {pid}", style="red")
+        raise typer.Exit(1)
+
+
+@app.command(name="api-setup")
+def api_setup(
+    username: str = typer.Option("admin", "--username", "-u", help="API username"),
+    password: Optional[str] = typer.Option(
+        None, "--password", "-p", help="Password (auto-generated if not provided)"
+    ),
+):
+    """Set up API authentication credentials and write them to .env."""
+    import re
+    import secrets as _secrets
+
+    import bcrypt as _bcrypt
+
+    if not password:
+        password = _secrets.token_urlsafe(16)
+        console.print(f"\n🔑 Generated password: [bold yellow]{password}[/bold yellow]")
+        console.print("   [dim]Save this — it won't be shown again.[/dim]")
+
+    pw_bytes = password.encode("utf-8")[:72]
+    hashed = _bcrypt.hashpw(pw_bytes, _bcrypt.gensalt()).decode("utf-8")
+    secret_key = _secrets.token_hex(32)
+
+    env_path = Path(_find_env_file())
+    content = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+    lines = content.splitlines()
+
+    updates = {
+        "API_USERNAME": username,
+        "API_PASSWORD_HASH": hashed,
+        "API_SECRET_KEY": secret_key,
+    }
+
+    for env_key, value in updates.items():
+        new_line = f"{env_key}={value}"
+        replaced = False
+        for i, line in enumerate(lines):
+            if re.match(rf"^{env_key}\s*=", line):
+                lines[i] = new_line
+                replaced = True
+                break
+        if not replaced:
+            lines.append(new_line)
+
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    console.print(f"\n✅ API credentials saved to [cyan]{env_path}[/cyan]")
+    console.print(f"   Username:   [cyan]{username}[/cyan]")
+    console.print(f"   Secret key: [dim]generated[/dim]")
+    console.print("\n[bold]Next steps:[/bold]")
+    console.print("  1. Start the server: [cyan]chess-coach serve[/cyan]")
+    console.print("  2. Get a token:      [cyan]POST /auth/token[/cyan]")
+    console.print("  3. View API docs:    [cyan]http://localhost:8000/docs[/cyan]")
 
 
 def main():

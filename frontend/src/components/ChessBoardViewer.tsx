@@ -42,9 +42,18 @@ interface Props {
    * A "Reset to game" button appears to go back to the game position.
    */
   interactive?: boolean
+  /**
+   * Called whenever the user navigates to a move position (idx > 0).
+   * Used by GamePage to trigger per-move AI explanation.
+   */
+  onMoveNavigate?: (fen: string, moveSan: string, moveUci: string, idx: number) => void
+  /**
+   * Slot for MoveExplanationPanel rendered below the current-move info box.
+   */
+  explanationPanel?: React.ReactNode
 }
 
-export default function ChessBoardViewer({ fens, moveSans, moves, interactive = false }: Props) {
+export default function ChessBoardViewer({ fens, moveSans, moves, interactive = false, onMoveNavigate, explanationPanel }: Props) {
   const [currentIdx, setCurrentIdx] = useState(0)
   // Exploration state: when the user drags pieces we diverge from the game FENs
   const [explorationFen, setExplorationFen] = useState<string | null>(null)
@@ -56,8 +65,16 @@ export default function ChessBoardViewer({ fens, moveSans, moves, interactive = 
       setCurrentIdx(clamped)
       setExplorationFen(null)
       setExplorationGame(null)
+      if (clamped > 0 && moveSans[clamped - 1]) {
+        onMoveNavigate?.(
+          fens[clamped],
+          moveSans[clamped - 1],
+          moves?.[clamped - 1]?.move_uci ?? '',
+          clamped,
+        )
+      }
     },
-    [fens.length],
+    [fens, moveSans, moves, onMoveNavigate],
   )
 
   const resetExploration = () => {
@@ -161,6 +178,11 @@ export default function ChessBoardViewer({ fens, moveSans, moves, interactive = 
             <span className="text-gray-400">Move {currentIdx}: </span>
             <span className="font-mono text-gray-200">{moveSans[currentIdx - 1]}</span>
           </div>
+        )}
+
+        {/* Per-move AI explanation panel */}
+        {explanationPanel && (
+          <div className="mt-4">{explanationPanel}</div>
         )}
       </div>
 

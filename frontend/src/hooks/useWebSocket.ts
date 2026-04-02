@@ -1,5 +1,5 @@
 import { useCallback, useRef, useState } from 'react'
-import type { WsProgressMessage } from '../types/analysis'
+import type { WsProgressMessage, MoveExplanation } from '../types/analysis'
 import { useAuthStore } from '../store/authStore'
 import { getBaseUrl } from '../services/api'
 
@@ -11,10 +11,19 @@ interface UseWebSocketReturn<T> {
   result: T | null
   error: string | null
   run: (request: object) => void
+  /** Send any message on the open socket (for move_analysis requests) */
+  sendMessage: (msg: object) => void
   reset: () => void
 }
 
-export function useAnalysisStream<T = unknown>(): UseWebSocketReturn<T> {
+export interface MoveAnalysisCallbacks {
+  onExplanationDone: (move_san: string, data: MoveExplanation) => void
+  onExplanationError: (move_san: string, message: string) => void
+}
+
+export function useAnalysisStream<T = unknown>(
+  moveCallbacks?: MoveAnalysisCallbacks,
+): UseWebSocketReturn<T> {
   const token = useAuthStore((s) => s.token)
   const wsRef = useRef<WebSocket | null>(null)
   // Use a ref so onclose/onerror always read the current status value
@@ -38,6 +47,13 @@ export function useAnalysisStream<T = unknown>(): UseWebSocketReturn<T> {
     setResult(null)
     setError(null)
   }, [_setStatus])
+
+  const sendMessage = useCallback((msg: object) => {
+    const ws = wsRef.current
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(msg))
+    }
+  }, [])
 
   const run = useCallback(
     (request: object) => {
@@ -77,11 +93,14 @@ export function useAnalysisStream<T = unknown>(): UseWebSocketReturn<T> {
         } else if (msg.type === 'result') {
           setResult(msg.analysis as T)
           _setStatus('done')
-          ws.close()
+          // Keep socket open — user may send move_analysis requests
         } else if (msg.type === 'error') {
           setError(msg.message as string)
           _setStatus('error')
-          ws.close()
+        } else if (msg.type === 'move_explanation_done') {
+          moveCallbacks?.onExplanationDone(msg.move_san, msg.data as MoveExplanation)
+        } else if (msg.type === 'move_explanation_error') {
+          moveCallbacks?.onExplanationError(msg.move_san, msg.message)
         }
       }
 
@@ -102,5 +121,5 @@ export function useAnalysisStream<T = unknown>(): UseWebSocketReturn<T> {
     [token, reset, _setStatus],
   )
 
-  return { status, progress, result, error, run, reset }
+  return { status, progress, result, error, run, sendMessage, reset }
 }

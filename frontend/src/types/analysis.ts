@@ -110,6 +110,21 @@ export interface Config {
   api: { username: string }
 }
 
+export interface MoveExplanation {
+  move_san: string
+  /** Normalised FEN (4-part, no halfmove/fullmove) — used as LRU cache key */
+  norm_fen: string
+  move_intent: string
+  why_bad: string
+  better_move_san: string
+  better_move_explanation: string
+  followup_line: string[]
+  best_followup_line: string[]
+  tactical_motif: string
+  game_phase: string
+  is_fallback: boolean
+}
+
 export type WsPingMessage = { type: 'ping' }
 
 export type WsProgressMessage = {
@@ -129,4 +144,22 @@ export type WsErrorMessage = {
   message: string
 }
 
-export type WsMessage = WsPingMessage | WsProgressMessage | WsResultMessage | WsErrorMessage
+export type WsMoveExplanationDoneMessage = {
+  type: 'move_explanation_done'
+  move_san: string
+  data: MoveExplanation
+}
+
+export type WsMoveExplanationErrorMessage = {
+  type: 'move_explanation_error'
+  move_san: string
+  message: string
+}
+
+export type WsMessage =
+  | WsPingMessage
+  | WsProgressMessage
+  | WsResultMessage
+  | WsErrorMessage
+  | WsMoveExplanationDoneMessage
+  | WsMoveExplanationErrorMessage

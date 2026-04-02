@@ -1,7 +1,9 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuthStore } from '../store/authStore'
 import { useAnalysisStream } from '../hooks/useWebSocket'
+import { useMoveAnalysis } from '../hooks/useMoveAnalysis'
+import type { MoveAnalysisRequest } from '../hooks/useMoveAnalysis'
 import { prefetchPgn } from '../services/api'
 import { parsePgnPreview } from '../utils/pgnPreview'
 import type { PgnPreview } from '../utils/pgnPreview'
@@ -10,6 +12,7 @@ import ClassificationTable from '../components/ClassificationTable'
 import CoachingReport from '../components/CoachingReport'
 import ChessBoardViewer from '../components/ChessBoardViewer'
 import GamePreviewPanel from '../components/GamePreviewPanel'
+import MoveExplanationPanel from '../components/MoveExplanationPanel'
 import type { GameAnalysis } from '../types/analysis'
 
 export default function GamePage() {
@@ -29,11 +32,31 @@ export default function GamePage() {
   const [urlFetchError, setUrlFetchError] = useState<string | null>(null)
   // Track the source label for the preview panel badge
   const [previewSource, setPreviewSource] = useState<string>('PGN')
+  // Whether the user has enabled per-move AI analysis
+  const [moveByMoveEnabled, setMoveByMoveEnabled] = useState(false)
 
   const urlDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  const { status, progress, result, error, run, reset } =
-    useAnalysisStream<GameAnalysis>()
+  // Stable forwarder — resolves circular dep: useMoveAnalysis → sendMessage → useAnalysisStream
+  const sendMessageRef = useRef<(msg: object) => void>(() => {})
+  const sendToWs = useCallback((msg: object) => sendMessageRef.current(msg), [])
+
+  const {
+    explanation,
+    loading: explanationLoading,
+    error: explanationError,
+    currentMoveSan,
+    analyse,
+    prefetch: prefetchMoves,
+    onExplanationDone,
+    onExplanationError,
+  } = useMoveAnalysis(sendToWs)
+
+  const { status, progress, result, error, run, sendMessage, reset } =
+    useAnalysisStream<GameAnalysis>({ onExplanationDone, onExplanationError })
+
+  // Keep forwarder in sync with the real sendMessage every render
+  sendMessageRef.current = sendMessage
 
   // Parse PGN preview immediately as user types
   useEffect(() => {
@@ -112,6 +135,7 @@ export default function GamePage() {
 
   function handleReset() {
     reset()
+    setMoveByMoveEnabled(false)
     // Keep the preview — user can re-analyze the same game
   }
 
@@ -122,6 +146,30 @@ export default function GamePage() {
   const INITIAL_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1'
   const boardFens = preview?.fens ?? [INITIAL_FEN]
   const boardSans = preview?.moveSans ?? []
+
+  const handleMoveNavigate = useCallback(
+    (fen: string, moveSan: string, moveUci: string, idx: number) => {
+      const recentMoves = boardSans.slice(Math.max(0, idx - 5), idx - 1)
+      const req: MoveAnalysisRequest = { fen, move_san: moveSan, move_uci: moveUci, recent_moves: recentMoves, mode: 'pgn' }
+      analyse(req)
+      // Pre-fetch next 2 moves silently
+      const upcoming: MoveAnalysisRequest[] = []
+      for (const offset of [1, 2]) {
+        const nIdx = idx + offset
+        if (nIdx < boardFens.length && boardSans[nIdx - 1]) {
+          upcoming.push({
+            fen: boardFens[nIdx],
+            move_san: boardSans[nIdx - 1],
+            move_uci: result?.moves?.[nIdx - 1]?.move_uci ?? '',
+            recent_moves: boardSans.slice(Math.max(0, nIdx - 5), nIdx - 1),
+            mode: 'pgn',
+          })
+        }
+      }
+      if (upcoming.length) prefetchMoves(upcoming)
+    },
+    [analyse, prefetchMoves, boardFens, boardSans, result],
+  )
 
   return (
     <div className="max-w-4xl mx-auto space-y-6">
@@ -270,17 +318,44 @@ export default function GamePage() {
               <h2 className="text-sm font-semibold text-gray-400">
                 {result ? 'Game Review' : 'Preview'}
               </h2>
-              {!result && (
-                <span className="text-xs text-gray-600">
-                  Navigate the board while analysis runs
-                </span>
-              )}
+              <div className="flex items-center gap-3">
+                {!result && !isRunning && (
+                  <span className="text-xs text-gray-600">
+                    Navigate the board while analysis runs
+                  </span>
+                )}
+                {!moveByMoveEnabled ? (
+                  <button
+                    type="button"
+                    onClick={() => setMoveByMoveEnabled(true)}
+                    disabled={isRunning}
+                    className="btn-secondary text-xs px-3 py-1"
+                  >
+                    Analyze Move by Move
+                  </button>
+                ) : (
+                  <span className="text-xs text-green-400 border border-green-800/60 bg-green-500/10 px-2 py-0.5 rounded">
+                    Move analysis on
+                  </span>
+                )}
+              </div>
             </div>
             <ChessBoardViewer
               fens={result ? preview.fens : boardFens}
               moveSans={result ? preview.moveSans : boardSans}
               moves={result?.moves}
               interactive={!isRunning}
+              onMoveNavigate={moveByMoveEnabled ? handleMoveNavigate : undefined}
+              explanationPanel={
+                moveByMoveEnabled && currentMoveSan ? (
+                  <MoveExplanationPanel
+                    moveSan={currentMoveSan}
+                    explanation={explanation}
+                    loading={explanationLoading}
+                    error={explanationError}
+                  />
+                ) : null
+              }
             />
           </div>
 

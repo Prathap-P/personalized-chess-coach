@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import time
 from typing import Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -88,6 +89,9 @@ async def analyze_stream(websocket: WebSocket) -> None:
     - {"type": "error", "message": "..."}
     """
     await websocket.accept()
+    client = websocket.client
+    client_addr = f"{client.host}:{client.port}" if client else "unknown"
+    logger.info(f"ws: CONNECT from {client_addr}")
     loop = asyncio.get_event_loop()
     queue: asyncio.Queue = asyncio.Queue()
     _DONE = object()  # sentinel
@@ -104,112 +108,14 @@ async def analyze_stream(websocket: WebSocket) -> None:
         token = auth_msg.get("token", "")
         username = _validate_ws_token(token)
         if not username:
+            logger.warning(f"ws: AUTH FAILED from {client_addr} — invalid/missing token")
             await _send(websocket, {"type": "error", "message": "Invalid or missing token"})
             await websocket.close(code=4001)
             return
 
-        # ── Step 2: receive analysis request ─────────────────────────────────
-        try:
-            request_msg = await asyncio.wait_for(websocket.receive_json(), timeout=30.0)
-        except asyncio.TimeoutError:
-            await _send(websocket, {"type": "error", "message": "Request timeout"})
-            await websocket.close(code=4000)
-            return
+        logger.info(f"ws: AUTH OK user={username} from {client_addr}")
 
-        analysis_type = request_msg.get("type", "game")
-        payload = request_msg.get("payload", {})
-
-        # ── Step 3: concurrency gate ──────────────────────────────────────────
-        semaphore = _get_semaphore()
-        if semaphore._value == 0:  # type: ignore[attr-defined]
-            await _send(websocket, {
-                "type": "error",
-                "message": "Server busy — too many analyses running simultaneously. Try again shortly.",
-            })
-            await websocket.close(code=4029)
-            return
-
-        # ── Progress callback (thread-safe) ───────────────────────────────────
-        def on_progress(current: int, total: int) -> None:
-            pct = round((current / total) * 100, 1) if total else 0.0
-            loop.call_soon_threadsafe(
-                queue.put_nowait,
-                {"type": "progress", "percent": pct, "current": current, "total": total},
-            )
-
-        # ── Background analysis worker ────────────────────────────────────────
-        def run_analysis() -> None:
-            global _active_analyses
-            _active_analyses += 1
-            try:
-                if analysis_type == "game":
-                    from .analyze import _run_game_analysis, _serialize_game_analysis
-                    from ...utils import download_game
-
-                    data = payload.get("data", "")
-                    if data.startswith("http"):
-                        data = download_game(data)
-
-                    analysis = _run_game_analysis(
-                        pgn=data,
-                        player=payload.get("player"),
-                        depth=payload.get("options", {}).get("depth"),
-                        include_llm=payload.get("options", {}).get("include_llm", False),
-                        skill_level=payload.get("options", {}).get("skill_level"),
-                        progress_callback=on_progress,
-                    )
-                    result = _serialize_game_analysis(analysis).model_dump()
-
-                else:  # profile
-                    from .analyze import _run_profile_analysis, _player_stats_to_response
-                    from ..schemas import PatternResponse, ProfileAnalysisResponse
-
-                    raw = _run_profile_analysis(
-                        username=payload.get("username", ""),
-                        platform=payload.get("platform", "lichess"),
-                        num_games=payload.get("num_games", 10),
-                        color=payload.get("color"),
-                        include_coaching=payload.get("options", {}).get("include_coaching", False),
-                        skill_level=payload.get("options", {}).get("skill_level"),
-                        progress_callback=on_progress,
-                    )
-                    patterns = [
-                        PatternResponse(
-                            pattern_type=p.pattern_type,
-                            description=p.description,
-                            occurrences=p.occurrences,
-                            severity=p.severity,
-                            examples=p.examples,
-                        ).model_dump()
-                        for p in raw["patterns"]
-                    ]
-                    result = ProfileAnalysisResponse(
-                        username=raw["username"],
-                        platform=raw["platform"],
-                        num_games_analyzed=raw["num_games_analyzed"],
-                        average_accuracy=raw["average_accuracy"],
-                        aggregated_stats=_player_stats_to_response(raw["aggregated_stats"]),
-                        patterns=patterns,
-                        opening_analysis=raw["opening_analysis"],
-                        phase_analysis=raw["phase_analysis"],
-                    ).model_dump()
-
-                loop.call_soon_threadsafe(
-                    queue.put_nowait,
-                    {"type": "result", "analysis": result},
-                )
-
-            except Exception as exc:
-                logger.exception("WebSocket analysis worker failed")
-                loop.call_soon_threadsafe(
-                    queue.put_nowait,
-                    {"type": "error", "message": str(exc)},
-                )
-            finally:
-                _active_analyses -= 1
-                loop.call_soon_threadsafe(queue.put_nowait, _DONE)
-
-        # ── Heartbeat task: application-level ping every 15 s ─────────────────
+        # ── Heartbeat task ────────────────────────────────────────────────────
         async def heartbeat() -> None:
             while True:
                 await asyncio.sleep(15)
@@ -217,22 +123,156 @@ async def analyze_stream(websocket: WebSocket) -> None:
 
         heartbeat_task = asyncio.ensure_future(heartbeat())
 
-        # ── Launch worker with semaphore + timeout ────────────────────────────
+        # ── Persistent message loop ───────────────────────────────────────────
+        # The socket stays open; client can send multiple requests:
+        #   - {"type": "game", "payload": {...}}
+        #   - {"type": "profile", "payload": {...}}
+        #   - {"type": "move_analysis", "payload": {...}}
         try:
-            async with semaphore:
-                analysis_future = loop.run_in_executor(None, run_analysis)
+            while True:
                 try:
-                    await asyncio.wait_for(
-                        asyncio.shield(analysis_future),
-                        timeout=ANALYSIS_TIMEOUT_SECONDS,
-                    )
+                    request_msg = await asyncio.wait_for(websocket.receive_json(), timeout=300.0)
                 except asyncio.TimeoutError:
+                    await _send(websocket, {"type": "ping"})
+                    continue
+
+                msg_type = request_msg.get("type", "game")
+                payload = request_msg.get("payload", {})
+                logger.info(f"ws: MESSAGE user={username} type={msg_type}")
+
+                # ── Per-move analysis (async, on-demand, cached) ──────────────
+                if msg_type == "move_analysis":
+                    from .move_analysis import handle_move_analysis
+                    await handle_move_analysis(
+                        payload=payload,
+                        user_id=username,
+                        send_fn=lambda m: _send(websocket, m),
+                    )
+                    continue
+
+                # ── Full game / profile analysis ──────────────────────────────
+                if msg_type not in ("game", "profile"):
+                    logger.warning(f"ws: unknown message type={msg_type} user={username}")
+                    await _send(websocket, {"type": "error", "message": f"Unknown type: {msg_type}"})
+                    continue
+
+                semaphore = _get_semaphore()
+                if semaphore._value == 0:  # type: ignore[attr-defined]
+                    logger.warning(f"ws: server busy, rejecting {msg_type} for user={username}")
+                    await _send(websocket, {
+                        "type": "error",
+                        "message": "Server busy — too many analyses running simultaneously. Try again shortly.",
+                    })
+                    continue
+
+                # ── Progress callback (thread-safe) ───────────────────────────
+                def on_progress(current: int, total: int) -> None:
+                    pct = round((current / total) * 100, 1) if total else 0.0
                     loop.call_soon_threadsafe(
                         queue.put_nowait,
-                        {"type": "error", "message": f"Analysis timed out after {ANALYSIS_TIMEOUT_SECONDS // 60} minutes"},
+                        {"type": "progress", "percent": pct, "current": current, "total": total},
                     )
-                    loop.call_soon_threadsafe(queue.put_nowait, _DONE)
-                    await analysis_future  # let cleanup finish
+
+                # ── Background analysis worker ────────────────────────────────
+                def run_analysis() -> None:
+                    global _active_analyses
+                    _active_analyses += 1
+                    t_start = time.perf_counter()
+                    logger.info(f"ws: analysis START type={msg_type} user={username} active={_active_analyses}")
+                    try:
+                        if msg_type == "game":
+                            from .analyze import _run_game_analysis, _serialize_game_analysis
+                            from ...utils import download_game
+
+                            data = payload.get("data", "")
+                            if data.startswith("http"):
+                                data = download_game(data)
+
+                            analysis = _run_game_analysis(
+                                pgn=data,
+                                player=payload.get("player"),
+                                depth=payload.get("options", {}).get("depth"),
+                                include_llm=payload.get("options", {}).get("include_llm", False),
+                                skill_level=payload.get("options", {}).get("skill_level"),
+                                progress_callback=on_progress,
+                            )
+                            result = _serialize_game_analysis(analysis).model_dump()
+
+                        else:  # profile
+                            from .analyze import _run_profile_analysis, _player_stats_to_response
+                            from ..schemas import PatternResponse, ProfileAnalysisResponse
+
+                            raw = _run_profile_analysis(
+                                username=payload.get("username", ""),
+                                platform=payload.get("platform", "lichess"),
+                                num_games=payload.get("num_games", 10),
+                                color=payload.get("color"),
+                                include_coaching=payload.get("options", {}).get("include_coaching", False),
+                                skill_level=payload.get("options", {}).get("skill_level"),
+                                progress_callback=on_progress,
+                            )
+                            patterns = [
+                                PatternResponse(
+                                    pattern_type=p.pattern_type,
+                                    description=p.description,
+                                    occurrences=p.occurrences,
+                                    severity=p.severity,
+                                    examples=p.examples,
+                                ).model_dump()
+                                for p in raw["patterns"]
+                            ]
+                            result = ProfileAnalysisResponse(
+                                username=raw["username"],
+                                platform=raw["platform"],
+                                num_games_analyzed=raw["num_games_analyzed"],
+                                average_accuracy=raw["average_accuracy"],
+                                aggregated_stats=_player_stats_to_response(raw["aggregated_stats"]),
+                                patterns=patterns,
+                                opening_analysis=raw["opening_analysis"],
+                                phase_analysis=raw["phase_analysis"],
+                            ).model_dump()
+
+                        loop.call_soon_threadsafe(
+                            queue.put_nowait,
+                            {"type": "result", "analysis": result},
+                        )
+                        logger.info(
+                            f"ws: analysis DONE type={msg_type} user={username} "
+                            f"elapsed={time.perf_counter()-t_start:.1f}s"
+                        )
+
+                    except Exception as exc:
+                        logger.exception(f"ws: analysis ERROR type={msg_type} user={username} — {exc}")
+                        loop.call_soon_threadsafe(
+                            queue.put_nowait,
+                            {"type": "error", "message": str(exc)},
+                        )
+                    finally:
+                        _active_analyses -= 1
+                        loop.call_soon_threadsafe(queue.put_nowait, _DONE)
+
+                # Run full analysis with semaphore + timeout, drain queue
+                async with semaphore:
+                    analysis_future = loop.run_in_executor(None, run_analysis)
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(analysis_future),
+                            timeout=ANALYSIS_TIMEOUT_SECONDS,
+                        )
+                    except asyncio.TimeoutError:
+                        loop.call_soon_threadsafe(
+                            queue.put_nowait,
+                            {"type": "error", "message": f"Analysis timed out after {ANALYSIS_TIMEOUT_SECONDS // 60} minutes"},
+                        )
+                        loop.call_soon_threadsafe(queue.put_nowait, _DONE)
+                        await analysis_future
+
+                while True:
+                    msg = await queue.get()
+                    if msg is _DONE:
+                        break
+                    await _send(websocket, msg)
+
         finally:
             heartbeat_task.cancel()
             try:
@@ -240,15 +280,8 @@ async def analyze_stream(websocket: WebSocket) -> None:
             except asyncio.CancelledError:
                 pass
 
-        # ── Drain the result queue ────────────────────────────────────────────
-        while True:
-            msg = await queue.get()
-            if msg is _DONE:
-                break
-            await _send(websocket, msg)
-
     except WebSocketDisconnect:
-        logger.info("WebSocket client disconnected during analysis")
+        logger.info(f"ws: DISCONNECT user={username if 'username' in dir() else 'unauthenticated'} from {client_addr}")
     except Exception as exc:
-        logger.error(f"WebSocket handler error: {exc}")
+        logger.error(f"ws: HANDLER ERROR user={username if 'username' in dir() else 'unauthenticated'} from {client_addr} — {exc}", exc_info=True)
         await _send(websocket, {"type": "error", "message": str(exc)})

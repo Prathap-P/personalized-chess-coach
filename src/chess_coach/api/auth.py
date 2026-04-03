@@ -91,12 +91,14 @@ async def login(request: TokenRequest) -> TokenResponse:
         )
 
     if request.username != settings.api_username:
+        logger.warning(f"auth: LOGIN FAILED — unknown username '{request.username}'")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials",
         )
 
     if not verify_password(request.password, settings.api_password_hash):
+        logger.warning(f"auth: LOGIN FAILED — wrong password for user '{request.username}'")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials",

@@ -78,7 +78,36 @@ app.include_router(stream_router)    # WS /api/v1/analyze/stream
 
 @app.on_event("startup")
 async def on_startup() -> None:
+    import sys
     from pathlib import Path
+
+    # Configure logging: write to stderr + a rotating file in the data/logs dir
+    log_dir = settings.logs_dir if hasattr(settings, "logs_dir") else Path("data/logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "chess_coach.log"
+
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        fmt = logging.Formatter(
+            "%(asctime)s %(levelname)-8s %(name)s │ %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        # Console handler
+        sh = logging.StreamHandler(sys.stderr)
+        sh.setFormatter(fmt)
+        root_logger.addHandler(sh)
+        # Rotating file handler (10 MB × 5 backups)
+        from logging.handlers import RotatingFileHandler
+        fh = RotatingFileHandler(log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
+        fh.setFormatter(fmt)
+        root_logger.addHandler(fh)
+
+    root_logger.setLevel(getattr(logging, settings.log_level.upper(), logging.INFO))
+    # Quiet noisy third-party loggers
+    for noisy in ("httpx", "httpcore", "uvicorn.access", "chess"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    logger.info(f"Logging configured: level={settings.log_level.upper()} file={log_file}")
 
     issues = []
     if not settings.api_secret_key:

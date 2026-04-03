@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import logging
+import time
 from typing import Callable, Optional
 
 import chess
@@ -121,20 +122,29 @@ def _run_game_analysis(
 ) -> GameAnalysis:
     """Run Stockfish game analysis synchronously (called via asyncio.to_thread)."""
     effective_depth = depth or settings.stockfish_depth
+    logger.info(
+        f"game_analysis: START depth={effective_depth} include_llm={include_llm} "
+        f"player={player!r} pgn_len={len(pgn)}"
+    )
+    t0 = time.perf_counter()
 
     # ── Cache lookup ──────────────────────────────────────────────────────────
     storage = GameStorage()
     cache_key = _pgn_cache_key(pgn, effective_depth, include_llm)
     cached = storage.get_cached_analysis(cache_key)
     if cached is not None:
-        logger.info(f"Cache hit for game {cached.game_id} (depth={effective_depth})")
+        logger.info(
+            f"game_analysis: cache HIT game={cached.game_id} depth={effective_depth} "
+            f"({(time.perf_counter()-t0)*1000:.0f}ms)"
+        )
         # Still fire synthetic progress so the UI bar fills quickly
         if progress_callback:
             total = cached.total_moves
             progress_callback(total, total)
         return cached
 
-    # ── Full analysis ─────────────────────────────────────────────────────────
+    # ── Full analysis ──
+    logger.debug(f"game_analysis: cache MISS — running Stockfish depth={effective_depth}")
     with StockfishEngine(depth=effective_depth) as engine:
         analyzer = GameAnalyzer(engine)
         analysis = analyzer.analyze_game(
@@ -144,8 +154,13 @@ def _run_game_analysis(
         )
 
     if include_llm:
+        t_llm = time.perf_counter()
         try:
             llm = LLMClient()
+            logger.debug(
+                f"game_analysis: calling LLM for game={analysis.game_id} "
+                f"model={llm.model} provider={llm.provider}"
+            )
             ws, bs = analysis.white_stats, analysis.black_stats
             errors = [
                 {
@@ -186,11 +201,17 @@ def _run_game_analysis(
             analysis.ai_strengths = ai.get("strengths", [])
             analysis.ai_weaknesses = ai.get("weaknesses", [])
             analysis.ai_recommendations = ai.get("recommendations", [])
+            logger.info(f"game_analysis: LLM done game={analysis.game_id} llm_time={(time.perf_counter()-t_llm)*1000:.0f}ms")
         except Exception as exc:
-            logger.warning(f"LLM analysis failed (non-fatal): {exc}")
+            logger.warning(f"LLM analysis failed (non-fatal) game={analysis.game_id}: {exc}")
 
     GameStorage().save_analysis(analysis)
     storage.set_cache_entry(cache_key, analysis.game_id)
+    logger.info(
+        f"game_analysis: DONE game={analysis.game_id} moves={analysis.total_moves} "
+        f"blunders={analysis.blunders} mistakes={analysis.mistakes} "
+        f"inaccuracies={analysis.inaccuracies} elapsed={(time.perf_counter()-t0):.1f}s"
+    )
     return analysis
 
 
@@ -204,8 +225,14 @@ def _run_profile_analysis(
     progress_callback: Optional[Callable] = None,
 ) -> dict:
     """Run multi-game profile analysis synchronously (called via asyncio.to_thread)."""
+    logger.info(
+        f"profile_analysis: START user={username!r} platform={platform} "
+        f"num_games={num_games} color={color!r} coaching={include_coaching}"
+    )
+    t0 = time.perf_counter()
     pgns = fetch_user_games(username, platform, limit=num_games)
     if not pgns:
+        logger.warning(f"profile_analysis: no games found for user={username!r} platform={platform}")
         raise ValueError("No games found for this user")
 
     analyses = []
@@ -219,6 +246,7 @@ def _run_profile_analysis(
                 analysis = analyzer.analyze_game(pgn, target_player=username)
                 analyses.append(analysis)
                 storage.save_analysis(analysis)
+                logger.debug(f"profile_analysis: game {idx}/{total} OK id={analysis.game_id}")
             except Exception as exc:
                 logger.error(f"Failed to analyze game {idx}/{total}: {exc}")
             finally:
@@ -226,6 +254,7 @@ def _run_profile_analysis(
                     progress_callback(idx, total)
 
     if not analyses:
+        logger.warning(f"profile_analysis: all {len(pgns)} games failed to analyze for user={username!r}")
         raise ValueError("No games could be analyzed")
 
     # Color filter
@@ -268,7 +297,7 @@ def _run_profile_analysis(
         **agg,
     )
 
-    return {
+    result = {
         "username": username,
         "platform": platform,
         "num_games_analyzed": len(analyses),
@@ -278,6 +307,11 @@ def _run_profile_analysis(
         "opening_analysis": pattern_results.get("opening_analysis", {}),
         "phase_analysis": pattern_results.get("phase_analysis", {}),
     }
+    logger.info(
+        f"profile_analysis: DONE user={username!r} games_ok={len(analyses)}/{len(pgns)} "
+        f"avg_accuracy={avg_accuracy} elapsed={(time.perf_counter()-t0):.1f}s"
+    )
+    return result
 
 
 # ── REST endpoints ────────────────────────────────────────────────────────────

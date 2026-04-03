@@ -31,6 +31,10 @@ class GameStorage:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
         with sqlite3.connect(self.db_path) as conn:
+            # WAL mode: concurrent reads + writes without contention
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS game_analyses (
                     game_id TEXT PRIMARY KEY,
@@ -57,6 +61,24 @@ class GameStorage:
                     game_id   TEXT NOT NULL,
                     created_at TIMESTAMP NOT NULL
                 )
+            """)
+
+            # Per-move position cache (position-based, cross-game reusable)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS move_explanations (
+                    cache_key      TEXT PRIMARY KEY,
+                    fen            TEXT NOT NULL,
+                    move_san       TEXT NOT NULL,
+                    best_move_san  TEXT,
+                    explanation    TEXT NOT NULL,
+                    tactical_motif TEXT,
+                    is_fallback    INTEGER NOT NULL DEFAULT 0,
+                    created_at     TIMESTAMP NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_move_exp_fen
+                ON move_explanations(fen)
             """)
 
     def save_analysis(self, analysis: GameAnalysis) -> None:
@@ -298,4 +320,71 @@ class GameStorage:
                 VALUES (?, ?, ?)
                 """,
                 (cache_key, game_id, datetime.utcnow().isoformat()),
+            )
+
+    # ── Per-move explanation cache ────────────────────────────────────────────
+
+    def get_move_explanation(
+        self, cache_key: str, ttl_days: int = 7
+    ) -> Optional[dict]:
+        """
+        Return cached move explanation dict or None if missing/expired/fallback.
+
+        A row with is_fallback=1 is returned only when the LLM is unavailable so
+        callers can decide whether to retry the real LLM.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM move_explanations WHERE cache_key = ?",
+                (cache_key,),
+            ).fetchone()
+            if not row:
+                return None
+            try:
+                age_days = (datetime.utcnow() - datetime.fromisoformat(row["created_at"])).days
+                if age_days > ttl_days:
+                    return None
+            except Exception:
+                return None
+
+            return {
+                "cache_key": row["cache_key"],
+                "fen": row["fen"],
+                "move_san": row["move_san"],
+                "best_move_san": row["best_move_san"],
+                "explanation": json.loads(row["explanation"]),
+                "tactical_motif": row["tactical_motif"],
+                "is_fallback": bool(row["is_fallback"]),
+            }
+
+    def set_move_explanation(
+        self,
+        cache_key: str,
+        fen: str,
+        move_san: str,
+        best_move_san: Optional[str],
+        explanation: dict,
+        tactical_motif: Optional[str] = None,
+        is_fallback: bool = False,
+    ) -> None:
+        """Persist a move explanation to the cache."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO move_explanations
+                (cache_key, fen, move_san, best_move_san, explanation,
+                 tactical_motif, is_fallback, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    cache_key,
+                    fen,
+                    move_san,
+                    best_move_san,
+                    json.dumps(explanation),
+                    tactical_motif,
+                    1 if is_fallback else 0,
+                    datetime.utcnow().isoformat(),
+                ),
             )

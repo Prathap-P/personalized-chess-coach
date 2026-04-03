@@ -33,6 +33,26 @@ class MistakeType(str, Enum):
     CALCULATION = "calculation"
 
 
+class GamePhase(str, Enum):
+    """Phase of the game."""
+
+    OPENING = "opening"
+    MIDDLEGAME = "middlegame"
+    ENDGAME = "endgame"
+
+
+class TacticalMotif(str, Enum):
+    """Tactical motifs detectable from a position."""
+
+    FORK = "fork"
+    PIN = "pin"
+    SKEWER = "skewer"
+    DISCOVERED_ATTACK = "discovered_attack"
+    BACK_RANK = "back_rank"
+    REMOVAL_OF_DEFENDER = "removal_of_defender"
+    ZWISCHENZUG = "zwischenzug"
+
+
 @dataclass
 class PositionEvaluation:
     """Stockfish evaluation of a position."""
@@ -81,6 +101,26 @@ class MoveAnalysis:
 
     mistake_type: Optional[MistakeType] = None
     comment: str = ""
+
+    # ── Per-move explanation fields (populated by on-demand move analysis) ──
+    # What does the played move accomplish (always present after analysis)
+    move_intent: str = ""
+    # Why the move is bad — empty if it was best/good
+    why_bad: str = ""
+    # Stockfish best move SAN — empty if played move was best
+    best_move_san: str = ""
+    # LLM explanation of why the best move is better
+    better_move_explanation: str = ""
+    # 3-move consequence line after the played move
+    followup_line: List[str] = field(default_factory=list)
+    # 3-move consequence line after the best move
+    best_followup_line: List[str] = field(default_factory=list)
+    # Tactical motif (fork/pin/skewer/etc.) or empty
+    tactical_motif: str = ""
+    # Game phase at this move
+    game_phase: str = ""
+    # Whether this move was explanation produced by template fallback (LLM unavailable)
+    is_explanation_fallback: bool = False
 
     @property
     def is_error(self) -> bool:

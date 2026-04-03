@@ -1,19 +1,85 @@
-"""LLM interface supporting LM Studio (local) and cloud providers."""
+"""LLM interface supporting LM Studio (local) and cloud providers via LangChain."""
 
 import logging
+import time
 from typing import Optional, List, Dict, Any
+
+from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.output_parsers import StrOutputParser
 
 from ..config import settings
 
 logger = logging.getLogger(__name__)
 
+_parser = StrOutputParser()
+
+
+def _build_chat_model(
+    provider: str,
+    model: str,
+    base_url: Optional[str],
+    api_key: Optional[str],
+    temperature: float,
+    max_tokens: Optional[int],
+) -> BaseChatModel:
+    """Instantiate the appropriate LangChain chat model for the given provider."""
+    common: Dict[str, Any] = {"temperature": temperature}
+    if max_tokens is not None:
+        common["max_tokens"] = max_tokens
+
+    # Local server (LM Studio, vLLM, local OpenAI-compatible endpoint)
+    if base_url:
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            model=model,
+            base_url=base_url,
+            api_key=api_key or "lm-studio",  # LM Studio ignores the key
+            **common,
+        )
+
+    if provider == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+        return ChatAnthropic(
+            model=model,
+            anthropic_api_key=api_key or settings.anthropic_api_key,
+            **common,
+        )
+
+    if provider == "ollama":
+        from langchain_ollama import ChatOllama
+        return ChatOllama(model=model, **common)
+
+    # Default: OpenAI (or any OpenAI-compatible cloud)
+    from langchain_openai import ChatOpenAI
+    return ChatOpenAI(
+        model=model,
+        api_key=api_key or settings.openai_api_key,
+        **common,
+    )
+
+
+def _to_lc_messages(messages: List[Dict[str, str]]) -> List[BaseMessage]:
+    """Convert role/content dicts to LangChain message objects."""
+    lc: List[BaseMessage] = []
+    for m in messages:
+        role, content = m["role"], m["content"]
+        if role == "system":
+            lc.append(SystemMessage(content=content))
+        else:
+            lc.append(HumanMessage(content=content))
+    return lc
+
 
 class LLMClient:
     """
-    Client for interacting with LLMs.
+    LangChain-backed LLM client.
 
-    For LM Studio (local): Uses OpenAI-compatible SDK directly via base_url.
-    For cloud providers: Uses LiteLLM.
+    Supports:
+    - LM Studio / local OpenAI-compatible servers (set llm_base_url)
+    - OpenAI cloud  (provider = "openai")
+    - Anthropic     (provider = "anthropic")
+    - Ollama        (provider = "ollama")
     """
 
     def __init__(
@@ -22,39 +88,25 @@ class LLMClient:
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
     ):
-        """
-        Initialize LLM client.
-
-        Args:
-            model: Model name (e.g., "nemotron-3-nano")
-            base_url: Local server URL (e.g., "http://localhost:1234/v1")
-            api_key: API key for cloud providers (not needed for LM Studio)
-        """
         self.model = model or settings.default_llm_model
         self.base_url = base_url or settings.llm_base_url
         self.api_key = api_key or settings.openai_api_key
-
-        # Determine mode: local (LM Studio) or cloud
-        self.is_local = bool(self.base_url)
-
-        if self.is_local:
-            # Use OpenAI SDK with custom base_url — most reliable for LM Studio
-            from openai import OpenAI
-            self._client = OpenAI(
-                base_url=self.base_url,
-                api_key=self.api_key or "lm-studio",  # LM Studio ignores this
-            )
-            logger.info(f"LLM: LM Studio at {self.base_url}, model={self.model}")
-        else:
-            # Cloud provider via LiteLLM
-            import litellm
-            litellm.drop_params = True
-            self._litellm = litellm
-            logger.info(f"LLM: Cloud provider, model={settings.default_llm_provider}/{self.model}")
+        self._provider = "lm_studio" if self.base_url else settings.default_llm_provider
+        logger.info(f"LLM: provider={self._provider}, model={self.model}, local={bool(self.base_url)}")
 
     @property
     def provider(self) -> str:
-        return "lm_studio" if self.is_local else settings.default_llm_provider
+        return self._provider
+
+    def _model(self, temperature: float, max_tokens: Optional[int]) -> BaseChatModel:
+        return _build_chat_model(
+            provider=self._provider,
+            model=self.model,
+            base_url=self.base_url,
+            api_key=self.api_key,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
 
     def complete(
         self,
@@ -63,62 +115,166 @@ class LLMClient:
         max_tokens: Optional[int] = None,
     ) -> str:
         """
-        Get completion from LLM.
+        Get a completion from the LLM.
 
         Args:
-            messages: List of message dicts with 'role' and 'content'
+            messages: List of {"role": "system"|"user", "content": str}
             temperature: Sampling temperature
-            max_tokens: Maximum tokens to generate
+            max_tokens: Max tokens to generate
 
         Returns:
-            Generated text response
+            Generated text string
         """
         try:
-            if self.is_local:
-                return self._complete_local(messages, temperature, max_tokens)
-            else:
-                return self._complete_cloud(messages, temperature, max_tokens)
+            t0 = time.perf_counter()
+            chain = self._model(temperature, max_tokens) | _parser
+            response = chain.invoke(_to_lc_messages(messages))
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.debug(
+                f"LLM complete: provider={self._provider} model={self.model} "
+                f"prompt_chars={sum(len(m['content']) for m in messages)} "
+                f"response_chars={len(response)} elapsed={elapsed:.0f}ms"
+            )
+            return response
         except Exception as e:
-            logger.error(f"LLM completion error: {e}")
+            logger.error(f"LLM complete error provider={self._provider} model={self.model}: {e}")
             raise
 
-    def _complete_local(
+    def explain_move_detailed(
         self,
-        messages: List[Dict[str, str]],
-        temperature: float,
-        max_tokens: Optional[int],
-    ) -> str:
-        """Call LM Studio via OpenAI-compatible SDK."""
-        kwargs = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": temperature,
-        }
-        if max_tokens is not None:
-            kwargs["max_tokens"] = max_tokens
+        *,
+        move_san: str,
+        best_move_san: Optional[str],
+        position_description: str,
+        eval_loss_cp: float,
+        classification: str,
+        followup_line: List[str],
+        best_followup_line: List[str],
+        tactical_motif: Optional[str],
+        game_phase: str,
+        recent_moves: List[str],
+    ) -> Dict[str, Any]:
+        """
+        Generate a per-move coaching explanation.
 
-        response = self._client.chat.completions.create(**kwargs)
-        return response.choices[0].message.content
+        Returns a dict with keys:
+            move_intent           -- what the played move accomplishes
+            why_bad               -- empty string if move was best/good
+            better_move_san       -- empty string if move was best
+            better_move_explanation -- empty string if move was best
+        """
+        is_good_move = best_move_san is None or best_move_san == move_san
 
-    def _complete_cloud(
+        motif_note = f"\nTactical motif detected: {tactical_motif}." if tactical_motif else ""
+        recent_note = (
+            f"\nRecent moves leading here: {' '.join(recent_moves[-5:])}"
+            if recent_moves else ""
+        )
+        followup_note = (
+            f"\nBest continuation after the played move: {' '.join(followup_line)}"
+            if followup_line else ""
+        )
+        best_note = (
+            f"\nBest continuation after {best_move_san}: {' '.join(best_followup_line)}"
+            if best_followup_line and not is_good_move else ""
+        )
+
+        if is_good_move:
+            prompt = f"""You are a chess coach. Explain what the move {move_san} accomplishes.
+
+Game phase: {game_phase}
+Position:{recent_note}
+{position_description}{followup_note}{motif_note}
+
+In 2-3 sentences, explain:
+- What does {move_san} accomplish positionally or tactically?
+- What plan or idea does it support?
+
+Be specific to the position, not generic.
+
+Respond with ONLY:
+INTENT: [2-3 sentences]"""
+        else:
+            prompt = f"""You are a chess coach. Analyse this chess move and explain why a better move exists.
+
+Game phase: {game_phase}
+Move played: {move_san} (classification: {classification}, eval loss: {eval_loss_cp:.0f} centipawns)
+Better move: {best_move_san}
+Position:{recent_note}
+{position_description}{followup_note}{best_note}{motif_note}
+
+Respond with ONLY these three sections:
+INTENT: [What was the player likely trying to achieve with {move_san}? 1-2 sentences]
+WHY_BAD: [Specifically why {move_san} is a {classification} — concrete consequences, not generic advice. 2-3 sentences]
+BETTER: [Why {best_move_san} is stronger — what specific threat, defence, or plan does it create? 2-3 sentences]"""
+
+        messages = [
+            {"role": "system", "content": "You are a precise chess coach. Answer only in the exact format requested. No extra text."},
+            {"role": "user", "content": prompt},
+        ]
+
+        try:
+            raw = self.complete(messages, temperature=0.4, max_tokens=350)
+            result = self._parse_move_explanation(raw, is_good_move, move_san, best_move_san)
+            logger.debug(
+                f"LLM explain_move: move={move_san} classification={classification} "
+                f"intent_len={len(result.get('move_intent',''))} fallback=False"
+            )
+            return result
+        except Exception as e:
+            logger.warning(f"LLM move explanation failed move={move_san}: {e}")
+            return self._fallback_move_explanation(move_san, best_move_san, eval_loss_cp, classification, tactical_motif)
+
+    def _parse_move_explanation(
         self,
-        messages: List[Dict[str, str]],
-        temperature: float,
-        max_tokens: Optional[int],
-    ) -> str:
-        """Call cloud provider via LiteLLM."""
-        model_string = self.model if "/" in self.model else f"{settings.default_llm_provider}/{self.model}"
-        kwargs = {
-            "model": model_string,
-            "messages": messages,
-            "temperature": temperature,
-            "api_key": self.api_key,
+        raw: str,
+        is_good_move: bool,
+        move_san: str,
+        best_move_san: Optional[str],
+    ) -> Dict[str, Any]:
+        """Parse structured LLM response into a clean dict."""
+        result: Dict[str, Any] = {
+            "move_intent": "",
+            "why_bad": "",
+            "better_move_san": "" if is_good_move else (best_move_san or ""),
+            "better_move_explanation": "",
         }
-        if max_tokens is not None:
-            kwargs["max_tokens"] = max_tokens
+        for line in raw.strip().splitlines():
+            line = line.strip()
+            if line.startswith("INTENT:"):
+                result["move_intent"] = line[len("INTENT:"):].strip()
+            elif line.startswith("WHY_BAD:"):
+                result["why_bad"] = line[len("WHY_BAD:"):].strip()
+            elif line.startswith("BETTER:"):
+                result["better_move_explanation"] = line[len("BETTER:"):].strip()
+        return result
 
-        response = self._litellm.completion(**kwargs)
-        return response.choices[0].message.content
+    def _fallback_move_explanation(
+        self,
+        move_san: str,
+        best_move_san: Optional[str],
+        eval_loss_cp: float,
+        classification: str,
+        tactical_motif: Optional[str],
+    ) -> Dict[str, Any]:
+        """Template-based fallback when LLM is unavailable."""
+        motif_txt = f" It involves a {tactical_motif} pattern." if tactical_motif else ""
+        if best_move_san and best_move_san != move_san:
+            why_bad = (
+                f"{move_san} loses {eval_loss_cp:.0f} centipawns ({classification}).{motif_txt} "
+                f"{best_move_san} was the stronger choice."
+            )
+            better = f"Playing {best_move_san} instead keeps a better position."
+        else:
+            why_bad = ""
+            better = ""
+        return {
+            "move_intent": f"{move_san} was played.",
+            "why_bad": why_bad,
+            "better_move_san": best_move_san or "",
+            "better_move_explanation": better,
+            "is_fallback": True,
+        }
 
     def generate_game_analysis(
         self,

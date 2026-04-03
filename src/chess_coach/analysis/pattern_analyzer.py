@@ -330,3 +330,86 @@ class PatternAnalyzer:
             ) / len(tactical_errors)
 
         return tactical_stats
+
+
+# ── Per-move tactical motif detection ────────────────────────────────────────
+
+def detect_motif(board_before: chess.Board, move: chess.Move) -> Optional[str]:
+    """
+    Detect the primary tactical motif of *move* played on *board_before*.
+
+    Uses pure python-chess attack / pin detection — no Stockfish, no LLM.
+    Returns one of: "fork", "pin", "skewer", "discovered_attack",
+    "back_rank", "removal_of_defender", or None.
+    """
+    board = board_before.copy()
+    moving_piece = board.piece_at(move.from_square)
+    if moving_piece is None:
+        return None
+
+    attacker_color = moving_piece.color
+    defender_color = not attacker_color
+
+    board.push(move)
+
+    # ── Back-rank mate threat ─────────────────────────────────────────────────
+    back_rank = chess.BB_RANK_1 if defender_color == chess.WHITE else chess.BB_RANK_8
+    king_sq = board.king(defender_color)
+    if king_sq is not None and (chess.BB_SQUARES[king_sq] & back_rank):
+        # Check if a rook or queen now threatens the back rank
+        for sq in chess.SquareSet(back_rank):
+            if board.is_attacked_by(attacker_color, sq):
+                return "back_rank"
+
+    # ── Fork — landing square attacks 2+ valuable pieces ─────────────────────
+    attacked_values: List[int] = []
+    _value = {chess.QUEEN: 9, chess.ROOK: 5, chess.BISHOP: 3,
+              chess.KNIGHT: 3, chess.PAWN: 1, chess.KING: 100}
+    for sq in board.attacks(move.to_square):
+        victim = board.piece_at(sq)
+        if victim and victim.color == defender_color:
+            attacked_values.append(_value.get(victim.piece_type, 0))
+    if len(attacked_values) >= 2 and sum(sorted(attacked_values)[-2:]) >= 6:
+        return "fork"
+
+    # ── Pin — moving piece now pins a defender to their king ─────────────────
+    for sq in chess.SQUARES:
+        piece = board.piece_at(sq)
+        if piece and piece.color == defender_color and piece.piece_type != chess.KING:
+            if board.is_pinned(defender_color, sq):
+                return "pin"
+
+    # ── Skewer — moving piece X-rays through a high-value piece ─────────────
+    if moving_piece.piece_type in (chess.QUEEN, chess.ROOK, chess.BISHOP):
+        for sq in board.attacks(move.to_square):
+            victim = board.piece_at(sq)
+            if victim and victim.color == defender_color:
+                if _value.get(victim.piece_type, 0) >= 5:  # rook or queen
+                    # Check there is something behind it on the ray
+                    direction = chess.square_file(sq) - chess.square_file(move.to_square), \
+                                chess.square_rank(sq) - chess.square_rank(move.to_square)
+                    if direction != (0, 0):
+                        return "skewer"
+
+    # ── Discovered attack — piece that moved reveals an attack behind it ─────
+    prev_attacks = board_before.attacks(move.from_square)
+    for sq in prev_attacks:
+        if board.is_attacked_by(attacker_color, sq) and not board_before.is_attacked_by(attacker_color, sq):
+            victim = board.piece_at(sq)
+            if victim and victim.color == defender_color and _value.get(victim.piece_type, 0) >= 3:
+                return "discovered_attack"
+
+    # ── Removal of defender ───────────────────────────────────────────────────
+    captured = board_before.piece_at(move.to_square)
+    if captured:
+        # Was the captured piece defending something valuable?
+        for sq in board_before.attacks(move.to_square):
+            defended = board_before.piece_at(sq)
+            if defended and defended.color == defender_color:
+                was_defended_by_captured = move.to_square in board_before.attackers(
+                    defender_color, sq
+                )
+                if was_defended_by_captured and _value.get(defended.piece_type, 0) >= 3:
+                    return "removal_of_defender"
+
+    return None

@@ -526,6 +526,7 @@ def serve(
             reload=reload,
             ws_ping_interval=20,   # protocol-level WS ping every 20 s
             ws_ping_timeout=60,    # close if no pong within 60 s
+            log_level="debug",
         )
 
 
